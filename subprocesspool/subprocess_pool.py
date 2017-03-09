@@ -1,35 +1,55 @@
 import os
 import sys
-import time
 import queue
+import atexit
+import weakref
 import threading
 from subprocess import Popen, PIPE
 from concurrent.futures import _base
 
+__all__ = ("SubprocessPoolExecutor", "DEFAULT_ENCODING")
+
 DEFAULT_ENCODING = sys.getdefaultencoding()
+_mgmt_thread = weakref.WeakKeyDictionary()
+_shutdown = False
 
 
-def _management_worker(work_queue, max_workers, shutdown):
+@atexit.register
+def _python_exit():
+    global _shutdown
+    _shutdown = True
+    items = list(_mgmt_thread.items())
+    for t, q in items:
+        q.put(None)
+        t.join()
+
+
+def _management_worker(executor_reference, work_queue):
     pending_proc = set()
-    while True:
-        pending_proc -= {w for w in pending_proc if w.done()}
-        if len(pending_proc) == 0:
-            work_item = work_queue.get()
-        elif len(pending_proc) < max_workers:
-            try:
-                work_item = work_queue.get_nowait()
-            except queue.Empty:
-                work_item = None
-        else:
-            continue
+    try:
+        while True:
+            pending_proc -= {w for w in pending_proc if w.done()}
+            executor = executor_reference()
+            max_workers = executor._max_workers \
+                if executor else work_queue.qsize() + 1
 
-        if work_item and not work_item.done():
-            pending_proc.add(work_item)
-        elif work_item is None and shutdown.is_set():
-            if len(pending_proc) > 0:
-                work_queue.put(None)
+            if len(pending_proc) == 0:
+                work_item = work_queue.get()
+            elif len(pending_proc) < max_workers:
+                try:
+                    work_item = work_queue.get_nowait()
+                except queue.Empty:
+                    work_item = None
+            else:
                 continue
-            break
+
+            if work_item and not work_item.done():
+                pending_proc.add(work_item)
+            if _shutdown or executor is None or executor._shutdown:
+                return
+            del work_item, executor
+    except BaseException:
+        _base.LOGGER.critical("Exception in worker", exc_info=True)
 
 
 class _WorkItem:
@@ -40,9 +60,8 @@ class _WorkItem:
         self.kwargs = kwargs.copy()
         self.kwargs['stdout'] = PIPE
         self.kwargs['stderr'] = PIPE
-        self.kwargs['shell'] = True
-        if not self.kwargs.get('encoding'):
-            self.kwargs['encoding'] = DEFAULT_ENCODING
+        self.kwargs['shell'] = kwargs.get("shell", True)
+        self.kwargs['encoding'] = self.kwargs.get('encoding', DEFAULT_ENCODING)
 
     def run(self):
         try:
@@ -55,7 +74,7 @@ class _WorkItem:
         if self._proc.poll() is not None:
             ok, err = self._proc.stdout.read(), self._proc.stderr.read()
             if err:
-                self.future.set_exception(err)
+                self.future.set_exception((self._proc.returncode, err))
             else:
                 self.future.set_result(ok)
 
@@ -87,52 +106,37 @@ class SubprocessPoolExecutor(_base.Executor):
 
         self._max_workers = max_workers
         self._work_queue = queue.Queue()
-        self._shutdown = threading.Event()
+        self._shutdown = False
         self._shutdown_lock = threading.Lock()
         self._management_thread = None
 
-    def submit(self, cmd, **kwargs):
+    def submit(self, cmd, *args, **kwargs):
         with self._shutdown_lock:
-            if self._shutdown.is_set():
+            if self._shutdown:
                 raise RuntimeError("cannot schedule new futures after shutdown.")
 
             f = _base.Future()
-            w = _WorkItem(f, cmd, kwargs)
+            w = _WorkItem(f, cmd.format(*args), kwargs)
 
             self._work_queue.put(w)
             self._start_management_thread()
             return f
 
-    def map(self, cmd, *iterables, timeout=None):
-        if timeout:
-            end_time = timeout + time.time()
-        fs = [self.submit(cmd, **{k: v for k, v in kws}) for kws in zip(*iterables)]
-
-        def result_iterator():
-            try:
-                for fut in fs:
-                    if timeout:
-                        yield fut.result(end_time - time.time())
-                    else:
-                        yield fut.result()
-            finally:
-                for fut in fs:
-                    fut.cancel()
-        return result_iterator()
-
     def _start_management_thread(self):
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
         if self._management_thread is None:
             self._management_thread = threading.Thread(
                     target=_management_worker,
-                    args=(self._work_queue,
-                        self._max_workers,
-                        self._shutdown))
+                    args=(weakref.ref(self, weakref_cb), self._work_queue))
             self._management_thread.daemon = True
             self._management_thread.start()
+            _mgmt_thread[self._management_thread] = self._work_queue
 
     def shutdown(self, wait=True):
         with self._shutdown_lock:
-            self._shutdown.set()
+            self._shutdown = True
             self._work_queue.put(None)
         if wait and self._management_thread:
             self._management_thread.join()
+    shutdown.__doc__ = _base.Executor.shutdown.__doc__

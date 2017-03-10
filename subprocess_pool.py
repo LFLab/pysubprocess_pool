@@ -1,5 +1,4 @@
 import os
-import sys
 import queue
 import atexit
 import weakref
@@ -7,9 +6,9 @@ import threading
 from subprocess import Popen, PIPE
 from concurrent.futures import _base
 
-__all__ = ("SubprocessPoolExecutor", "DEFAULT_ENCODING")
+__all__ = ["SubprocessPoolExecutor"]
+__version__ = "0.1.0"
 
-DEFAULT_ENCODING = sys.getdefaultencoding()
 _mgmt_thread = weakref.WeakKeyDictionary()
 _shutdown = False
 
@@ -56,25 +55,32 @@ class _WorkItem:
     def __init__(self, future, cmd, kwargs):
         self.future = future
         self._proc = None
+        self.cancelled = False
         self.cmd = cmd
         self.kwargs = kwargs.copy()
         self.kwargs['stdout'] = PIPE
         self.kwargs['stderr'] = PIPE
         self.kwargs['shell'] = kwargs.get("shell", True)
-        self.kwargs['encoding'] = self.kwargs.get('encoding', DEFAULT_ENCODING)
+        self.kwargs['universal_newlines'] = kwargs.get('universal_newlines', True)
 
     def run(self):
+        if not self.future.set_running_or_notify_cancel():
+            return
         try:
             if not self._proc:
                 self._proc = Popen(self.cmd, **self.kwargs)
-        except Exception as e:
+        except BaseException as e:
             self.future.set_exception(e)
 
     def poll(self):
-        if self._proc.poll() is not None:
+        if self.future.cancelled():
+            return True
+
+        if self._proc and self._proc.poll() is not None:
             ok, err = self._proc.stdout.read(), self._proc.stderr.read()
             if err:
-                self.future.set_exception((self._proc.returncode, err))
+                e = ChildProcessError(self._proc.returncode, err)
+                self.future.set_exception(e)
             else:
                 self.future.set_result(ok)
 
@@ -111,6 +117,19 @@ class SubprocessPoolExecutor(_base.Executor):
         self._management_thread = None
 
     def submit(self, cmd, *args, **kwargs):
+        """Submits a command to be executed as Popen(cmd.format(*args), **kwargs)
+
+        Schedules the command to delegate for `subprocess.Popen()` and return a
+        Future instance representing the execution of the callable.
+        there have some arguments different with Popen are:
+            - stdout, stderr always `PIPE`. (not allowed re-assign)
+            - shell be changed to True for default.
+            - universal_newlines be changed to True for default.
+            - position arguments need to use keyword arguments for propagate.
+
+        Returns:
+            A Future representing the given call.
+        """
         with self._shutdown_lock:
             if self._shutdown:
                 raise RuntimeError("cannot schedule new futures after shutdown.")
